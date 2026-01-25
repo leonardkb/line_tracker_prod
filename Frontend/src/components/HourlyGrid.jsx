@@ -1,6 +1,6 @@
 import { useMemo } from "react";
 import { safeNum } from "../utils/calc";
-import { cumulative } from "../utils/timeSlots";
+import { cumulative } from "../utils/timeslots";
 
 export default function HourlyGrid({ target, slots, stitched, onChangeStitched }) {
   const wh = useMemo(() => (slots || []).reduce((a, s) => a + safeNum(s.hours), 0), [slots]);

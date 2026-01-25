@@ -3,7 +3,7 @@ import HeaderForm from "../components/HeaderForm";
 import MetaSummary from "../components/MetaSummary";
 import OperationPlanner from "../components/OperationPlanner";
 import { calcTargetFromSAM } from "../utils/calc";
-import { buildShiftSlots } from "../utils/timeSlots";
+import { buildShiftSlots } from "../utils/timeslots";
 
 const initialHeader = {
   line: "",
