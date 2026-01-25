@@ -4,6 +4,8 @@ import MetaSummary from "../components/MetaSummary";
 import OperationPlanner from "../components/OperationPlanner";
 import { calcTargetFromSAM } from "../utils/calc";
 import { buildShiftSlots } from "../utils/timeslots";
+import Navbar from "../components/Navbar";
+
 
 const initialHeader = {
   line: "",
@@ -60,12 +62,13 @@ export default function PlannerPage() {
 
   return (
     <div className="min-h-screen bg-gray-50">
+     <Navbar/>
       <div className="mx-auto max-w-7xl p-4 sm:p-6">
         <div className="mb-4 flex flex-col gap-3">
           <div className="flex items-start justify-between gap-4">
             <div>
               <h1 className="text-xl sm:text-2xl font-semibold text-gray-900">
-                Line Meta & Hourly Sewing Tracker
+                Line Planner
               </h1>
               <p className="text-sm text-gray-600">
                 Enter line details → get target/meta → plan operations → track hourly output with running totals.
