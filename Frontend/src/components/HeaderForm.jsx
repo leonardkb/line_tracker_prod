@@ -1,8 +1,11 @@
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import { calcTargetFromSAM, safeNum } from "../utils/calc";
 import { STYLE_EFFICIENCY_PRESETS } from "../utils/efficiency";
 
-export default function HeaderForm({ value, onChange }) {
+export default function HeaderForm({ value, onChange, slots }) {
+  const [loading, setLoading] = useState(false);
+  const [message, setMessage] = useState("");
+
   const set = (k, v) => onChange({ ...value, [k]: v });
 
   const target = useMemo(() => {
@@ -18,6 +21,45 @@ export default function HeaderForm({ value, onChange }) {
     const wh = safeNum(value.workingHours);
     return wh > 0 ? target / wh : 0;
   }, [target, value.workingHours]);
+
+  // ✅ Handle save button click
+  const handleSave = async () => {
+    setLoading(true);
+    setMessage("");
+
+    try {
+      const payload = {
+        line: value.line,
+        date: value.date,
+        style: value.style,
+        operators: value.operators,
+        workingHours: value.workingHours,
+        sam: value.sam,
+        efficiency: value.efficiency || 0.7,
+        target: target,
+        targetPerHour: targetPerHour,
+        slots: slots || []
+      };
+
+      const response = await fetch("http://localhost:5000/api/save-production", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+
+      const data = await response.json();
+
+      if (data.success) {
+        setMessage(`✅ Saved! Line Run ID: ${data.lineRunId}`);
+      } else {
+        setMessage(`❌ Error: ${data.error}`);
+      }
+    } catch (err) {
+      setMessage(`❌ Failed to save: ${err.message}`);
+    } finally {
+      setLoading(false);
+    }
+  };
 
   return (
     <div className="rounded-2xl border bg-white shadow-sm">
@@ -71,7 +113,6 @@ export default function HeaderForm({ value, onChange }) {
           onChange={(v) => set("sam", v)}
         />
 
-        {/* ✅ Efficiency selector */}
         <label className="block">
           <div className="text-sm font-medium text-gray-800 mb-1">Efficiency</div>
           <select
@@ -91,10 +132,31 @@ export default function HeaderForm({ value, onChange }) {
           </div>
         </label>
 
-        {/* ✅ Results */}
         <div className="md:col-span-2 lg:col-span-3 grid grid-cols-1 sm:grid-cols-2 gap-3">
           <Metric label="Target (pieces)" value={target} />
           <Metric label="Target / hour (pieces)" value={targetPerHour} />
+        </div>
+
+        {/* ✅ Save button and message */}
+        <div className="md:col-span-2 lg:col-span-3">
+          <button
+            onClick={handleSave}
+            disabled={loading || !value.line || !value.date}
+            className="w-full bg-gray-900 text-white font-medium py-3 rounded-xl 
+                       hover:bg-gray-800 disabled:opacity-50 disabled:cursor-not-allowed
+                       transition-colors"
+          >
+            {loading ? "Saving..." : "💾 Save Production Data"}
+          </button>
+          {message && (
+            <div className={`mt-3 p-3 rounded-lg text-sm ${
+              message.includes("✅") 
+                ? "bg-green-50 text-green-700" 
+                : "bg-red-50 text-red-700"
+            }`}>
+              {message}
+            </div>
+          )}
         </div>
       </div>
     </div>
