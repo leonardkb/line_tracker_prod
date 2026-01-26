@@ -1,3 +1,4 @@
+
 import { useEffect, useMemo, useState } from "react";
 import { safeNum, calcCapacityPerHourFromTimes } from "../utils/calc";
 import HourlyGrid from "./HourlyGrid";
@@ -60,11 +61,15 @@ export default function OperationPlanner({
   slots,
   selectedOperatorNo = "ALL",
   onOperatorNosChange,
+  currentRunId, // ✅ Added: receive current run ID from parent
 }) {
   const [rows, setRows] = useState(() => [newRow(slots || [])]);
-
   const [searchText, setSearchText] = useState("");
   const [operatorFilterNo, setOperatorFilterNo] = useState("ALL");
+  const [savingOperations, setSavingOperations] = useState(false);
+  const [savingHourly, setSavingHourly] = useState(false);
+  const [saveOpsMessage, setSaveOpsMessage] = useState("");
+  const [saveHourlyMessage, setSaveHourlyMessage] = useState("");
 
   useEffect(() => {
     setRows((prev) => prev.map((r) => ensureRowHasAllSlotKeys(r, slots)));
@@ -180,6 +185,139 @@ export default function OperationPlanner({
     setSearchText("");
   };
 
+  // ✅ SAVE OPERATORS & OPERATIONS (Step 2 data)
+  const handleSaveOperations = async () => {
+    if (!currentRunId) {
+      setSaveOpsMessage("❌ Please save Line Inputs (Step 1) first to get a Run ID");
+      return;
+    }
+
+    if (computedRows.length === 0) {
+      setSaveOpsMessage("❌ No operation data to save");
+      return;
+    }
+
+    setSavingOperations(true);
+    setSaveOpsMessage("");
+
+    try {
+      // Calculate slot targets based on current data
+      const wh = (slots || []).reduce((a, s) => a + safeNum(s.hours), 0);
+      const t = safeNum(target);
+      const targetPerHour = wh > 0 ? t / wh : 0;
+      
+      const slotTargets = (slots || []).map((s) => 
+        Number((targetPerHour * safeNum(s.hours)).toFixed(2))
+      );
+      
+      const cumulativeTargets = slotTargets.map((_, i) => {
+        const cum = slotTargets.slice(0, i + 1).reduce((a, b) => a + b, 0);
+        return Number(Math.min(t, cum).toFixed(2));
+      });
+
+      // Prepare operations data WITHOUT stitched quantities
+      const operations = computedRows.map(row => ({
+        operatorNo: row.operatorNo,
+        operatorName: row.operatorName,
+        operation: row.operation,
+        t1: row.t1,
+        t2: row.t2,
+        t3: row.t3,
+        t4: row.t4,
+        t5: row.t5,
+        capacityPerHour: row.capPerOperator || 0
+        // Note: NOT including stitched data here
+      }));
+
+      const payload = {
+        runId: currentRunId,
+        operations,
+        slotTargets,
+        cumulativeTargets
+      };
+
+      const response = await fetch("http://localhost:5000/api/save-operations", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+
+      const data = await response.json();
+
+      if (data.success) {
+        setSaveOpsMessage(`✅ Saved ${data.operationsCount || operations.length} operations! Slot targets saved.`);
+      } else {
+        setSaveOpsMessage(`❌ Error: ${data.error}`);
+      }
+    } catch (err) {
+      setSaveOpsMessage(`❌ Failed to save operations: ${err.message}`);
+    } finally {
+      setSavingOperations(false);
+    }
+  };
+
+  // ✅ SAVE HOURLY STITCHED DATA (Separate function)
+ // ✅ SAVE HOURLY STITCHED DATA (Separate function) - FIXED
+const handleSaveHourlyData = async () => {
+  if (!currentRunId) {
+    setSaveHourlyMessage("❌ Please save operations first");
+    return;
+  }
+
+  setSavingHourly(true);
+  setSaveHourlyMessage("");
+
+  try {
+    // Prepare hourly data for all operations
+    const hourlyPayloads = [];
+    
+    computedRows.forEach(row => {
+      if (row.stitched && row.operatorNo && row.operation) {
+        // Find the slot labels from slots array
+        (slots || []).forEach((slot, index) => {
+          const stitchedQty = row.stitched[slot.id];
+          if (stitchedQty !== "" && stitchedQty !== null && stitchedQty !== undefined) {
+            hourlyPayloads.push({
+              runId: currentRunId,
+              operatorNo: row.operatorNo,
+              operationName: row.operation,
+              slotLabel: slot.label,  // Use slot.label not slot.id
+              stitchedQty: parseFloat(stitchedQty) || 0
+            });
+          }
+        });
+      }
+    });
+
+    if (hourlyPayloads.length === 0) {
+      setSaveHourlyMessage("⚠️ No hourly data to save");
+      setSavingHourly(false);
+      return;
+    }
+
+    console.log(`📤 Saving ${hourlyPayloads.length} hourly entries...`);
+    
+    // Save all hourly entries
+    const response = await fetch("http://localhost:5000/api/save-hourly-data", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ entries: hourlyPayloads })
+    });
+
+    const data = await response.json();
+
+    if (data.success) {
+      setSaveHourlyMessage(`✅ Saved ${data.savedCount} hourly entries${data.skippedCount ? ` (${data.skippedCount} skipped)` : ''}`);
+    } else {
+      setSaveHourlyMessage(`❌ Error: ${data.error}`);
+    }
+  } catch (err) {
+    setSaveHourlyMessage(`❌ Failed to save hourly data: ${err.message}`);
+  } finally {
+    setSavingHourly(false);
+  }
+};
+
   return (
     <div className="rounded-2xl border bg-white shadow-sm">
       <div className="px-5 py-4 border-b flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
@@ -261,6 +399,77 @@ export default function OperationPlanner({
                 <span className="font-semibold text-gray-900">Operator {selectedOperatorNo}</span>
               </div>
             ) : null}
+          </div>
+
+          {/* SAVE BUTTONS SECTION */}
+          <div className="px-5 py-4 border-b bg-gray-50">
+            <div className="flex flex-col gap-4">
+              {/* Save Operations Button */}
+              <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+                <div>
+                  <div className="text-sm font-semibold text-gray-900">Save Operators & Operations</div>
+                  <div className="text-xs text-gray-600">
+                    Save operator details, operations, and hourly targets.
+                    {!currentRunId && " (Save Step 1 first to get Run ID)"}
+                  </div>
+                </div>
+                
+                <button
+                  onClick={handleSaveOperations}
+                  disabled={savingOperations || !currentRunId || computedRows.length === 0}
+                  className="inline-flex items-center justify-center rounded-xl px-6 py-3 text-sm font-medium
+                             bg-blue-600 text-white hover:bg-blue-700 active:bg-blue-800 
+                             disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                >
+                  {savingOperations ? "Saving..." : "💾 Save Step 2 Data"}
+                </button>
+              </div>
+              
+              {saveOpsMessage && (
+                <div className={`p-3 rounded-lg text-sm ${
+                  saveOpsMessage.includes("✅") 
+                    ? "bg-green-50 text-green-700 border border-green-200" 
+                    : saveOpsMessage.includes("⚠️")
+                    ? "bg-yellow-50 text-yellow-700 border border-yellow-200"
+                    : "bg-red-50 text-red-700 border border-red-200"
+                }`}>
+                  {saveOpsMessage}
+                </div>
+              )}
+              
+              {/* Save Hourly Data Button */}
+              <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 pt-3 border-t">
+                <div>
+                  <div className="text-sm font-semibold text-gray-900">Save Hourly Stitched Data</div>
+                  <div className="text-xs text-gray-600">
+                    Save actual stitched quantities for each hourly slot.
+                    {!currentRunId && " (Save Step 1 & 2 first)"}
+                  </div>
+                </div>
+                
+                <button
+                  onClick={handleSaveHourlyData}
+                  disabled={savingHourly || !currentRunId || computedRows.length === 0}
+                  className="inline-flex items-center justify-center rounded-xl px-6 py-3 text-sm font-medium
+                             bg-green-600 text-white hover:bg-green-700 active:bg-green-800 
+                             disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                >
+                  {savingHourly ? "Saving..." : "📊 Save Hourly Output"}
+                </button>
+              </div>
+              
+              {saveHourlyMessage && (
+                <div className={`p-3 rounded-lg text-sm ${
+                  saveHourlyMessage.includes("✅") 
+                    ? "bg-green-50 text-green-700 border border-green-200" 
+                    : saveHourlyMessage.includes("⚠️")
+                    ? "bg-yellow-50 text-yellow-700 border border-yellow-200"
+                    : "bg-red-50 text-red-700 border border-red-200"
+                }`}>
+                  {saveHourlyMessage}
+                </div>
+              )}
+            </div>
           </div>
 
           {/* GROUPS */}

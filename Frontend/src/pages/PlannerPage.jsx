@@ -1,3 +1,4 @@
+
 import { useMemo, useState } from "react";
 import HeaderForm from "../components/HeaderForm";
 import MetaSummary from "../components/MetaSummary";
@@ -5,7 +6,6 @@ import OperationPlanner from "../components/OperationPlanner";
 import { calcTargetFromSAM } from "../utils/calc";
 import { buildShiftSlots } from "../utils/timeslots";
 import Navbar from "../components/Navbar";
-
 
 const initialHeader = {
   line: "",
@@ -19,6 +19,7 @@ const initialHeader = {
 
 export default function PlannerPage() {
   const [header, setHeader] = useState(initialHeader);
+  const [currentRunId, setCurrentRunId] = useState(null); // ✅ Added: store current run ID
 
   // ✅ Quick nav state
   const [activePanel, setActivePanel] = useState("inputs"); // inputs | summary | operations
@@ -60,6 +61,12 @@ export default function PlannerPage() {
     return uniq.sort((a, b) => Number(a) - Number(b));
   }, [operatorNos]);
 
+  // ✅ Handle save success from HeaderForm to get the run ID
+  const handleSaveSuccess = (runId) => {
+    setCurrentRunId(runId);
+    console.log(`✅ Step 1 saved. Current Run ID: ${runId}`);
+  };
+
   return (
     <div className="min-h-screen bg-gray-50">
      <Navbar/>
@@ -79,6 +86,7 @@ export default function PlannerPage() {
               <div className="text-xs text-gray-500">Status</div>
               <div className="text-sm font-medium text-gray-900">
                 {target > 0 ? "Ready to Track" : "Waiting for Inputs"}
+                {currentRunId && ` • Run ID: ${currentRunId}`}
               </div>
             </div>
           </div>
@@ -134,7 +142,13 @@ export default function PlannerPage() {
         {activePanel === "inputs" && (
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
             <div className="lg:col-span-2">
-              <HeaderForm value={header} onChange={setHeader}  slots={slots} />
+              {/* Pass onSaveSuccess callback to HeaderForm */}
+              <HeaderForm 
+                value={header} 
+                onChange={setHeader}  
+                slots={slots}
+                onSaveSuccess={handleSaveSuccess}
+              />
             </div>
             <div className="lg:col-span-1">
               <MetaSummary header={header} target={target} slots={slots} />
@@ -155,6 +169,7 @@ export default function PlannerPage() {
               slots={slots}
               selectedOperatorNo={selectedOperatorNo} // ✅ filter by operator no
               onOperatorNosChange={setOperatorNos}   // ✅ collect operator nos for buttons
+              currentRunId={currentRunId}            // ✅ pass current run ID for saving
             />
           </div>
         )}

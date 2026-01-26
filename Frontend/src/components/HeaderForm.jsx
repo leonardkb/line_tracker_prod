@@ -1,8 +1,9 @@
+
 import { useMemo, useState } from "react";
 import { calcTargetFromSAM, safeNum } from "../utils/calc";
 import { STYLE_EFFICIENCY_PRESETS } from "../utils/efficiency";
 
-export default function HeaderForm({ value, onChange, slots }) {
+export default function HeaderForm({ value, onChange, slots, onSaveSuccess }) {
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState("");
 
@@ -50,7 +51,13 @@ export default function HeaderForm({ value, onChange, slots }) {
       const data = await response.json();
 
       if (data.success) {
-        setMessage(`✅ Saved! Line Run ID: ${data.lineRunId}`);
+        const messageText = `✅ Saved! Line Run ID: ${data.lineRunId}`;
+        setMessage(messageText);
+        
+        // ✅ Call onSaveSuccess callback if provided
+        if (onSaveSuccess) {
+          onSaveSuccess(data.lineRunId);
+        }
       } else {
         setMessage(`❌ Error: ${data.error}`);
       }
