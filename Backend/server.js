@@ -1,3 +1,4 @@
+
 require("dotenv").config();
 const express = require("express");
 const { Pool } = require("pg");
@@ -18,6 +19,131 @@ const pool = new Pool({
   idleTimeoutMillis: 30000
 });
 
+// Create all tables with correct constraints
+const createAllTables = async () => {
+  try {
+    console.log("🔄 Creating/verifying database tables...");
+    
+    // 1. Create line_runs table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS line_runs(
+        id BIGSERIAL PRIMARY KEY,
+        line_no TEXT NOT NULL,
+        run_date DATE NOT NULL,
+        style TEXT NOT NULL,
+        operators_count INT NOT NULL DEFAULT 0,
+        working_hours NUMERIC(6,2) NOT NULL,
+        sam_minutes NUMERIC(10,2) NOT NULL,
+        efficiency NUMERIC(4,3) NOT NULL,
+        target_pcs NUMERIC(12,2) NOT NULL DEFAULT 0,
+        target_per_hour NUMERIC(12,2) NOT NULL DEFAULT 0,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        CONSTRAINT uq_line_run UNIQUE (line_no, run_date, style),
+        CONSTRAINT chk_efficiency_range CHECK (efficiency > 0 AND efficiency <= 1),
+        CONSTRAINT chk_working_hours_positive CHECK (working_hours > 0),
+        CONSTRAINT chk_sam_positive CHECK (sam_minutes > 0)
+      );
+    `);
+    console.log("✅ line_runs table ready");
+
+    // 2. Create shift_slots table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS shift_slots(
+        id BIGSERIAL PRIMARY KEY,
+        run_id BIGINT NOT NULL REFERENCES line_runs(id) ON DELETE CASCADE,
+        slot_order INT NOT NULL,
+        slot_label TEXT NOT NULL,
+        slot_start TIME NULL,
+        slot_end TIME NULL,
+        planned_hours NUMERIC(6,3) NOT NULL,
+        UNIQUE (run_id, slot_order),
+        UNIQUE (run_id, slot_label),
+        CONSTRAINT chk_planned_hours_nonnegative CHECK (planned_hours >= 0)
+      );
+    `);
+    console.log("✅ shift_slots table ready");
+
+    // 3. Create run_operators table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS run_operators(
+        id BIGSERIAL PRIMARY KEY,
+        run_id BIGINT NOT NULL REFERENCES line_runs(id) ON DELETE CASCADE,
+        operator_no INT NOT NULL,
+        operator_name TEXT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        UNIQUE (run_id, operator_no),
+        CONSTRAINT chk_operator_no_positive CHECK (operator_no > 0)
+      );
+    `);
+    console.log("✅ run_operators table ready");
+
+    // 4. Create operator_operations table - FIXED with correct constraint
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS operator_operations(
+        id BIGSERIAL PRIMARY KEY,
+        run_id BIGINT NOT NULL REFERENCES line_runs(id) ON DELETE CASCADE,
+        run_operator_id BIGINT NOT NULL REFERENCES run_operators(id) ON DELETE CASCADE,
+        operation_name TEXT NOT NULL,
+        t1_sec NUMERIC(10,2) NULL,
+        t2_sec NUMERIC(10,2) NULL,
+        t3_sec NUMERIC(10,2) NULL,
+        t4_sec NUMERIC(10,2) NULL,
+        t5_sec NUMERIC(10,2) NULL,
+        capacity_per_hour NUMERIC(12,3) NOT NULL DEFAULT 0,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        UNIQUE (run_operator_id, operation_name)  -- FIXED: This is the correct constraint
+      );
+    `);
+    console.log("✅ operator_operations table ready");
+
+    // 5. Create operation_hourly_entries table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS operation_hourly_entries(
+        id BIGSERIAL PRIMARY KEY,
+        run_id BIGINT NOT NULL REFERENCES line_runs(id) ON DELETE CASCADE,
+        operation_id BIGINT NOT NULL REFERENCES operator_operations(id) ON DELETE CASCADE,
+        slot_id BIGINT NOT NULL REFERENCES shift_slots(id) ON DELETE CASCADE,
+        stitched_qty NUMERIC(12,2) NOT NULL DEFAULT 0,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        UNIQUE (operation_id, slot_id),
+        CONSTRAINT chk_stitched_qty_nonnegative CHECK (stitched_qty >= 0)
+      );
+    `);
+    console.log("✅ operation_hourly_entries table ready");
+
+    // 6. Create slot_targets table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS slot_targets(
+        id BIGSERIAL PRIMARY KEY,
+        run_id BIGINT NOT NULL REFERENCES line_runs(id) ON DELETE CASCADE,
+        slot_id BIGINT NOT NULL REFERENCES shift_slots(id) ON DELETE CASCADE,
+        slot_target NUMERIC(12,2) NOT NULL DEFAULT 0,
+        cumulative_target NUMERIC(12,2) NOT NULL DEFAULT 0,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        UNIQUE (run_id, slot_id)
+      );
+    `);
+    console.log("✅ slot_targets table ready");
+
+    // Create indexes
+    await pool.query("CREATE INDEX IF NOT EXISTS idx_line_runs_line_date ON line_runs (line_no, run_date);");
+    await pool.query("CREATE INDEX IF NOT EXISTS idx_shift_slots_run ON shift_slots(run_id);");
+    await pool.query("CREATE INDEX IF NOT EXISTS idx_run_operators_run ON run_operators(run_id);");
+    await pool.query("CREATE INDEX IF NOT EXISTS idx_operator_ops_run ON operator_operations(run_id);");
+    await pool.query("CREATE INDEX IF NOT EXISTS idx_operator_ops_operator ON operator_operations(run_operator_id);");
+    await pool.query("CREATE INDEX IF NOT EXISTS idx_hourly_entries_run ON operation_hourly_entries(run_id);");
+    await pool.query("CREATE INDEX IF NOT EXISTS idx_hourly_entries_operation ON operation_hourly_entries(operation_id);");
+    await pool.query("CREATE INDEX IF NOT EXISTS idx_hourly_entries_slot ON operation_hourly_entries(slot_id);");
+    
+    console.log("✅ All tables and indexes created successfully");
+  } catch (err) {
+    console.error("❌ Error creating tables:", err.message);
+  }
+};
+
 async function testConnection() {
   try {
     const client = await pool.connect();
@@ -25,16 +151,22 @@ async function testConnection() {
     const res = await client.query("SELECT now()");
     console.log("🕒 Server time:", res.rows[0]);
     client.release();
-    console.log("♻️ Connection returned to pool (not closed)");
+    
+    // Create all tables after connection
+    await createAllTables();
   } catch (err) {
     console.error("❌ Database connection failed");
     console.error(err.message);
   }
 }
 
-// ✅ Save line inputs and shift slots together
+// ✅ Save line inputs and shift slots together (Step 1)
 app.post("/api/save-production", async (req, res) => {
+  const client = await pool.connect();
+  
   try {
+    await client.query("BEGIN");
+    
     const { line, date, style, operators, workingHours, sam, efficiency, target, targetPerHour, slots } = req.body;
 
     // Validate required fields
@@ -45,7 +177,7 @@ app.post("/api/save-production", async (req, res) => {
       });
     }
 
-    // Insert into line_runs table with correct field names
+    // Insert into line_runs table
     const lineRunQuery = `
       INSERT INTO line_runs (
         line_no, 
@@ -64,22 +196,23 @@ app.post("/api/save-production", async (req, res) => {
       RETURNING id;
     `;
 
-    const lineRunResult = await pool.query(lineRunQuery, [
-      line,                              // line_no
-      date,                              // run_date
-      style,                             // style
-      parseInt(operators) || 0,          // operators_count
-      parseFloat(workingHours),          // working_hours
-      parseFloat(sam),                   // sam_minutes
-      parseFloat(efficiency) || 0.7,     // efficiency
-      parseFloat(target) || 0,           // target_pcs
-      parseFloat(targetPerHour) || 0     // target_per_hour
+    const lineRunResult = await client.query(lineRunQuery, [
+      line,
+      date,
+      style,
+      parseInt(operators) || 0,
+      parseFloat(workingHours),
+      parseFloat(sam),
+      parseFloat(efficiency) || 0.7,
+      parseFloat(target) || 0,
+      parseFloat(targetPerHour) || 0
     ]);
 
     const runId = lineRunResult.rows[0].id;
     console.log(`✅ Line run saved with ID: ${runId}`);
 
-    // Insert shift slots into shift_slots table with correct field names
+    // Insert shift slots
+    const slotIds = {};
     if (slots && slots.length > 0) {
       const slotQuery = `
         INSERT INTO shift_slots (
@@ -91,33 +224,514 @@ app.post("/api/save-production", async (req, res) => {
           planned_hours
         )
         VALUES ($1, $2, $3, $4, $5, $6)
+        RETURNING id, slot_label;
       `;
 
       for (let i = 0; i < slots.length; i++) {
         const slot = slots[i];
-        await pool.query(slotQuery, [
-          runId,                         // run_id
-          i + 1,                         // slot_order (1-based index)
-          slot.label,                    // slot_label (e.g., "09:00")
-          slot.startTime || null,        // slot_start (optional)
-          slot.endTime || null,          // slot_end (optional)
-          parseFloat(slot.hours) || 0    // planned_hours
+        const slotResult = await client.query(slotQuery, [
+          runId,
+          i + 1,
+          slot.label,
+          slot.startTime || null,
+          slot.endTime || null,
+          parseFloat(slot.hours) || 0
         ]);
+        
+        slotIds[slot.label] = slotResult.rows[0].id;
       }
       console.log(`✅ ${slots.length} shift slots saved for line run ${runId}`);
     }
 
+    await client.query("COMMIT");
+    
     res.json({ 
       success: true, 
       message: "Production data saved successfully",
-      runId 
+      lineRunId: runId,
+      slotIds // Return slot IDs mapping for frontend reference
     });
   } catch (err) {
+    await client.query("ROLLBACK");
     console.error("❌ Error saving production data:", err.message);
     res.status(500).json({ 
       success: false, 
       error: err.message 
     });
+  } finally {
+    client.release();
+  }
+});
+
+// ✅ Save operators and operations (Step 2) - FIXED VERSION
+app.post("/api/save-operations", async (req, res) => {
+  const client = await pool.connect();
+  
+  try {
+    await client.query("BEGIN");
+    
+    const { 
+      runId, 
+      operations, 
+      slotTargets, 
+      cumulativeTargets 
+    } = req.body;
+
+    if (!runId || !operations || !Array.isArray(operations)) {
+      return res.status(400).json({ 
+        success: false, 
+        error: "Missing required data" 
+      });
+    }
+
+    // Verify run exists
+    const runCheck = await client.query(
+      "SELECT id FROM line_runs WHERE id = $1",
+      [runId]
+    );
+    
+    if (runCheck.rows.length === 0) {
+      return res.status(404).json({ 
+        success: false, 
+        error: "Line run not found" 
+      });
+    }
+
+    // Get slot IDs for this run
+    const slotsResult = await client.query(
+      "SELECT id, slot_label FROM shift_slots WHERE run_id = $1 ORDER BY slot_order",
+      [runId]
+    );
+    
+    const slotMap = {};
+    slotsResult.rows.forEach(slot => {
+      slotMap[slot.slot_label] = slot.id;
+    });
+
+    // Process each operation row
+    const operatorMap = {};
+    let savedOperations = 0;
+    
+    for (const operation of operations) {
+      const { 
+        operatorNo, 
+        operatorName, 
+        operation: operationName, 
+        t1, t2, t3, t4, t5, 
+        capacityPerHour
+      } = operation;
+
+      // Skip if no operator number
+      if (!operatorNo) {
+        console.log("⚠️ Skipping operation without operator number");
+        continue;
+      }
+
+      const opNo = parseInt(operatorNo);
+      
+      try {
+        // Insert or get existing operator
+        if (!operatorMap[opNo]) {
+          const operatorQuery = `
+            INSERT INTO run_operators (run_id, operator_no, operator_name, created_at)
+            VALUES ($1, $2, $3, NOW())
+            ON CONFLICT (run_id, operator_no) 
+            DO UPDATE SET operator_name = EXCLUDED.operator_name
+            RETURNING id;
+          `;
+          
+          const operatorResult = await client.query(operatorQuery, [
+            runId,
+            opNo,
+            operatorName || null
+          ]);
+          
+          operatorMap[opNo] = operatorResult.rows[0].id;
+          console.log(`✅ Operator ${opNo} saved/updated: ID ${operatorMap[opNo]}`);
+        }
+
+        // Insert operation - FIXED: Use correct constraint
+        const operationQuery = `
+          INSERT INTO operator_operations (
+            run_id,
+            run_operator_id,
+            operation_name,
+            t1_sec,
+            t2_sec,
+            t3_sec,
+            t4_sec,
+            t5_sec,
+            capacity_per_hour,
+            created_at
+          )
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+          ON CONFLICT (run_operator_id, operation_name)  -- FIXED: Match the UNIQUE constraint
+          DO UPDATE SET 
+            t1_sec = EXCLUDED.t1_sec,
+            t2_sec = EXCLUDED.t2_sec,
+            t3_sec = EXCLUDED.t3_sec,
+            t4_sec = EXCLUDED.t4_sec,
+            t5_sec = EXCLUDED.t5_sec,
+            capacity_per_hour = EXCLUDED.capacity_per_hour
+          RETURNING id;
+        `;
+        
+        const opResult = await client.query(operationQuery, [
+          runId,
+          operatorMap[opNo],
+          operationName || 'Unnamed Operation',
+          t1 ? parseFloat(t1) : null,
+          t2 ? parseFloat(t2) : null,
+          t3 ? parseFloat(t3) : null,
+          t4 ? parseFloat(t4) : null,
+          t5 ? parseFloat(t5) : null,
+          capacityPerHour || 0
+        ]);
+        
+        savedOperations++;
+        console.log(`✅ Operation "${operationName || 'Unnamed'}" saved for operator ${opNo}: ID ${opResult.rows[0].id}`);
+        
+      } catch (opErr) {
+        console.error(`❌ Error saving operation for operator ${opNo}:`, opErr.message);
+        // Continue with next operation instead of failing all
+        continue;
+      }
+    }
+
+    // Save slot targets (hourly plan targets)
+    if (slotTargets && cumulativeTargets && slotsResult.rows.length > 0) {
+      let savedTargets = 0;
+      for (let i = 0; i < slotsResult.rows.length; i++) {
+        const slot = slotsResult.rows[i];
+        const slotTarget = slotTargets[i] || 0;
+        const cumulativeTarget = cumulativeTargets[i] || 0;
+        
+        const slotTargetQuery = `
+          INSERT INTO slot_targets (run_id, slot_id, slot_target, cumulative_target, created_at, updated_at)
+          VALUES ($1, $2, $3, $4, NOW(), NOW())
+          ON CONFLICT (run_id, slot_id)
+          DO UPDATE SET 
+            slot_target = EXCLUDED.slot_target,
+            cumulative_target = EXCLUDED.cumulative_target,
+            updated_at = NOW();
+        `;
+        
+        await client.query(slotTargetQuery, [
+          runId,
+          slot.id,
+          parseFloat(slotTarget),
+          parseFloat(cumulativeTarget)
+        ]);
+        savedTargets++;
+      }
+      console.log(`✅ ${savedTargets} slot targets saved for run ${runId}`);
+    }
+
+    await client.query("COMMIT");
+    
+    console.log(`✅ Operations saved for run ${runId}: ${savedOperations} operations`);
+    
+    res.json({ 
+      success: true, 
+      message: "Operations data saved successfully",
+      operationsCount: savedOperations,
+      operatorCount: Object.keys(operatorMap).length
+    });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("❌ Error saving operations data:", err.message);
+    res.status(500).json({ 
+      success: false, 
+      error: err.message 
+    });
+  } finally {
+    client.release();
+  }
+});
+
+// ✅ Save hourly stitched data separately - FIXED VERSION
+app.post("/api/save-hourly-data", async (req, res) => {
+  const client = await pool.connect();
+  
+  try {
+    await client.query("BEGIN");
+    
+    const { entries } = req.body;
+    
+    if (!entries || !Array.isArray(entries)) {
+      return res.status(400).json({ 
+        success: false, 
+        error: "Missing hourly data entries" 
+      });
+    }
+
+    let savedCount = 0;
+    let skippedCount = 0;
+    
+    for (const entry of entries) {
+      const { runId, operatorNo, operationName, slotLabel, stitchedQty } = entry;
+      
+      if (!runId || !operatorNo || !operationName || !slotLabel) {
+        skippedCount++;
+        continue;
+      }
+      
+      try {
+        // Get operator and operation IDs
+        const opResult = await client.query(`
+          SELECT o.id as op_id, ro.id as operator_id
+          FROM operator_operations o
+          JOIN run_operators ro ON o.run_operator_id = ro.id
+          WHERE o.run_id = $1 
+            AND ro.operator_no = $2 
+            AND o.operation_name = $3
+          LIMIT 1
+        `, [runId, parseInt(operatorNo), operationName]);
+        
+        if (opResult.rows.length === 0) {
+          console.warn(`⚠️ Operation not found: ${operatorNo} - ${operationName}. Creating it now...`);
+          
+          // Try to create the operation if it doesn't exist
+          const createOpResult = await client.query(`
+            WITH new_operator AS (
+              INSERT INTO run_operators (run_id, operator_no, operator_name, created_at)
+              VALUES ($1, $2, $3, NOW())
+              ON CONFLICT (run_id, operator_no) 
+              DO UPDATE SET operator_name = EXCLUDED.operator_name
+              RETURNING id
+            )
+            INSERT INTO operator_operations (
+              run_id,
+              run_operator_id,
+              operation_name,
+              capacity_per_hour,
+              created_at
+            )
+            SELECT $1, id, $4, 0, NOW()
+            FROM new_operator
+            RETURNING id;
+          `, [runId, parseInt(operatorNo), `Operator ${operatorNo}`, operationName]);
+          
+          if (createOpResult.rows.length === 0) {
+            console.warn(`❌ Failed to create operation: ${operatorNo} - ${operationName}`);
+            skippedCount++;
+            continue;
+          }
+          
+          var operationId = createOpResult.rows[0].id;
+          console.log(`✅ Created missing operation: ${operatorNo} - ${operationName} (ID: ${operationId})`);
+        } else {
+          var operationId = opResult.rows[0].op_id;
+        }
+        
+        // Get slot ID
+        const slotResult = await client.query(
+          "SELECT id FROM shift_slots WHERE run_id = $1 AND slot_label = $2",
+          [runId, slotLabel]
+        );
+        
+        if (slotResult.rows.length === 0) {
+          console.warn(`⚠️ Slot not found: ${slotLabel} for run ${runId}`);
+          skippedCount++;
+          continue;
+        }
+        
+        const slotId = slotResult.rows[0].id;
+        
+        // Save hourly entry
+        const hourlyQuery = `
+          INSERT INTO operation_hourly_entries (
+            run_id,
+            operation_id,
+            slot_id,
+            stitched_qty,
+            created_at,
+            updated_at
+          )
+          VALUES ($1, $2, $3, $4, NOW(), NOW())
+          ON CONFLICT (operation_id, slot_id)
+          DO UPDATE SET 
+            stitched_qty = EXCLUDED.stitched_qty,
+            updated_at = NOW();
+        `;
+        
+        await client.query(hourlyQuery, [
+          runId,
+          operationId,
+          slotId,
+          parseFloat(stitchedQty) || 0
+        ]);
+        
+        savedCount++;
+        
+      } catch (entryErr) {
+        console.error(`❌ Error saving hourly entry for ${operatorNo}-${operationName}:`, entryErr.message);
+        skippedCount++;
+      }
+    }
+
+    await client.query("COMMIT");
+    
+    console.log(`✅ Hourly data saved: ${savedCount} entries, ${skippedCount} skipped`);
+    
+    res.json({ 
+      success: true, 
+      message: "Hourly data saved",
+      savedCount,
+      skippedCount
+    });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("❌ Error saving hourly data:", err.message);
+    res.status(500).json({ 
+      success: false, 
+      error: err.message 
+    });
+  } finally {
+    client.release();
+  }
+});
+
+// ✅ Get saved data for a run
+app.get("/api/get-run-data/:runId", async (req, res) => {
+  try {
+    const { runId } = req.params;
+    
+    // Get line run data
+    const runResult = await pool.query(
+      "SELECT * FROM line_runs WHERE id = $1",
+      [runId]
+    );
+    
+    if (runResult.rows.length === 0) {
+      return res.status(404).json({ 
+        success: false, 
+        error: "Run not found" 
+      });
+    }
+    
+    const runData = runResult.rows[0];
+    
+    // Get shift slots
+    const slotsResult = await pool.query(
+      `SELECT id, slot_order, slot_label, slot_start, slot_end, planned_hours 
+       FROM shift_slots 
+       WHERE run_id = $1 
+       ORDER BY slot_order`,
+      [runId]
+    );
+    
+    // Get operators
+    const operatorsResult = await pool.query(
+      `SELECT id, operator_no, operator_name 
+       FROM run_operators 
+       WHERE run_id = $1 
+       ORDER BY operator_no`,
+      [runId]
+    );
+    
+    // Get slot targets
+    const slotTargetsResult = await pool.query(
+      `SELECT s.slot_label, t.slot_target, t.cumulative_target
+       FROM slot_targets t
+       JOIN shift_slots s ON t.slot_id = s.id
+       WHERE t.run_id = $1
+       ORDER BY s.slot_order`,
+      [runId]
+    );
+    
+    // Get operations with their hourly data
+    const operationsData = [];
+    
+    for (const operator of operatorsResult.rows) {
+      const operationsResult = await pool.query(
+        `SELECT o.*, 
+                json_agg(
+                  json_build_object(
+                    'slot_label', s.slot_label,
+                    'stitched_qty', h.stitched_qty
+                  ) ORDER BY ss.slot_order
+                ) FILTER (WHERE h.stitched_qty IS NOT NULL) as hourly_data
+         FROM operator_operations o
+         LEFT JOIN operation_hourly_entries h ON o.id = h.operation_id
+         LEFT JOIN shift_slots s ON h.slot_id = s.id
+         LEFT JOIN shift_slots ss ON s.id = ss.id
+         WHERE o.run_operator_id = $1 AND o.run_id = $2
+         GROUP BY o.id
+         ORDER BY o.created_at`,
+        [operator.id, runId]
+      );
+      
+      operationsData.push({
+        operator,
+        operations: operationsResult.rows
+      });
+    }
+    
+    res.json({
+      success: true,
+      run: runData,
+      slots: slotsResult.rows,
+      operators: operatorsResult.rows,
+      operations: operationsData,
+      slotTargets: slotTargetsResult.rows
+    });
+    
+  } catch (err) {
+    console.error("❌ Error fetching run data:", err.message);
+    res.status(500).json({ 
+      success: false, 
+      error: err.message 
+    });
+  }
+});
+
+// Health check
+app.get("/api/health", async (req, res) => {
+  try {
+    await pool.query("SELECT 1");
+    res.json({ 
+      success: true, 
+      message: "Server and database are running",
+      timestamp: new Date().toISOString()
+    });
+  } catch (err) {
+    res.status(500).json({ 
+      success: false, 
+      error: "Database connection failed" 
+    });
+  }
+});
+
+// ✅ Reset/clear all data (for testing)
+app.post("/api/reset-database", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    
+    // Delete in correct order (respecting foreign keys)
+    await client.query("DELETE FROM operation_hourly_entries");
+    await client.query("DELETE FROM slot_targets");
+    await client.query("DELETE FROM operator_operations");
+    await client.query("DELETE FROM run_operators");
+    await client.query("DELETE FROM shift_slots");
+    await client.query("DELETE FROM line_runs");
+    
+    await client.query("COMMIT");
+    
+    res.json({ 
+      success: true, 
+      message: "Database cleared successfully" 
+    });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("❌ Error resetting database:", err.message);
+    res.status(500).json({ 
+      success: false, 
+      error: err.message 
+    });
+  } finally {
+    client.release();
   }
 });
 
