@@ -735,6 +735,378 @@ app.post("/api/reset-database", async (req, res) => {
   }
 });
 
+
+// Add these endpoints after your existing endpoints:
+
+// ✅ Get all saved line runs (for dropdown)
+app.get("/api/line-runs", async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT 
+        id,
+        line_no,
+        run_date,
+        style,
+        operators_count,
+        working_hours,
+        sam_minutes,
+        efficiency,
+        target_pcs,
+        target_per_hour,
+        created_at
+      FROM line_runs
+      ORDER BY run_date DESC, line_no
+    `);
+    
+    res.json({
+      success: true,
+      runs: result.rows
+    });
+  } catch (err) {
+    console.error("❌ Error fetching line runs:", err.message);
+    res.status(500).json({ 
+      success: false, 
+      error: err.message 
+    });
+  }
+});
+
+// ✅ Get line runs by line number
+app.get("/api/line-runs/:lineNo", async (req, res) => {
+  try {
+    const { lineNo } = req.params;
+    
+    const result = await pool.query(`
+      SELECT 
+        id,
+        line_no,
+        run_date,
+        style,
+        operators_count,
+        working_hours,
+        sam_minutes,
+        efficiency,
+        target_pcs,
+        target_per_hour,
+        created_at
+      FROM line_runs
+      WHERE line_no = $1
+      ORDER BY run_date DESC
+    `, [lineNo]);
+    
+    res.json({
+      success: true,
+      runs: result.rows
+    });
+  } catch (err) {
+    console.error("❌ Error fetching line runs by line:", err.message);
+    res.status(500).json({ 
+      success: false, 
+      error: err.message 
+    });
+  }
+});
+
+// ✅ Get complete run data for editing
+app.get("/api/run/:runId", async (req, res) => {
+  try {
+    const { runId } = req.params;
+    
+    // Get line run data
+    const runResult = await pool.query(
+      "SELECT * FROM line_runs WHERE id = $1",
+      [runId]
+    );
+    
+    if (runResult.rows.length === 0) {
+      return res.status(404).json({ 
+        success: false, 
+        error: "Run not found" 
+      });
+    }
+    
+    const runData = runResult.rows[0];
+    
+    // Get shift slots
+    const slotsResult = await pool.query(
+      `SELECT id, slot_order, slot_label, slot_start, slot_end, planned_hours 
+       FROM shift_slots 
+       WHERE run_id = $1 
+       ORDER BY slot_order`,
+      [runId]
+    );
+    
+    // Get operators
+    const operatorsResult = await pool.query(
+      `SELECT id, operator_no, operator_name 
+       FROM run_operators 
+       WHERE run_id = $1 
+       ORDER BY operator_no`,
+      [runId]
+    );
+    
+    // Get slot targets
+    const slotTargetsResult = await pool.query(
+      `SELECT s.slot_label, t.slot_target, t.cumulative_target
+       FROM slot_targets t
+       JOIN shift_slots s ON t.slot_id = s.id
+       WHERE t.run_id = $1
+       ORDER BY s.slot_order`,
+      [runId]
+    );
+    
+    // Get operations with their hourly data
+    const operationsData = [];
+    
+    for (const operator of operatorsResult.rows) {
+      const operationsResult = await pool.query(
+        `SELECT 
+          o.id,
+          o.operation_name,
+          o.t1_sec,
+          o.t2_sec,
+          o.t3_sec,
+          o.t4_sec,
+          o.t5_sec,
+          o.capacity_per_hour,
+          json_object_agg(
+            COALESCE(s.slot_label, ''),
+            COALESCE(h.stitched_qty, 0)
+          ) as stitched_data
+         FROM operator_operations o
+         LEFT JOIN operation_hourly_entries h ON o.id = h.operation_id
+         LEFT JOIN shift_slots s ON h.slot_id = s.id
+         WHERE o.run_operator_id = $1 AND o.run_id = $2
+         GROUP BY o.id
+         ORDER BY o.created_at`,
+        [operator.id, runId]
+      );
+      
+      operationsData.push({
+        operator,
+        operations: operationsResult.rows
+      });
+    }
+    
+    res.json({
+      success: true,
+      run: runData,
+      slots: slotsResult.rows,
+      operators: operatorsResult.rows,
+      operations: operationsData,
+      slotTargets: slotTargetsResult.rows
+    });
+    
+  } catch (err) {
+    console.error("❌ Error fetching run data:", err.message);
+    res.status(500).json({ 
+      success: false, 
+      error: err.message 
+    });
+  }
+});
+
+// ✅ Update hourly stitched data for a specific run
+app.post("/api/update-hourly-data/:runId", async (req, res) => {
+  const client = await pool.connect();
+  
+  try {
+    await client.query("BEGIN");
+    
+    const { runId } = req.params;
+    const { entries } = req.body;
+    
+    if (!entries || !Array.isArray(entries)) {
+      return res.status(400).json({ 
+        success: false, 
+        error: "Missing hourly data entries" 
+      });
+    }
+
+    let savedCount = 0;
+    let updatedCount = 0;
+    
+    for (const entry of entries) {
+      const { operatorNo, operationName, slotLabel, stitchedQty } = entry;
+      
+      if (!operatorNo || !operationName || !slotLabel) {
+        continue;
+      }
+      
+      // Get operation ID
+      const opResult = await client.query(`
+        SELECT o.id as op_id
+        FROM operator_operations o
+        JOIN run_operators ro ON o.run_operator_id = ro.id
+        WHERE o.run_id = $1 
+          AND ro.operator_no = $2 
+          AND o.operation_name = $3
+        LIMIT 1
+      `, [runId, parseInt(operatorNo), operationName]);
+      
+      if (opResult.rows.length === 0) {
+        console.warn(`⚠️ Operation not found: ${operatorNo} - ${operationName}`);
+        continue;
+      }
+      
+      const operationId = opResult.rows[0].op_id;
+      
+      // Get slot ID
+      const slotResult = await client.query(
+        "SELECT id FROM shift_slots WHERE run_id = $1 AND slot_label = $2",
+        [runId, slotLabel]
+      );
+      
+      if (slotResult.rows.length === 0) {
+        console.warn(`⚠️ Slot not found: ${slotLabel}`);
+        continue;
+      }
+      
+      const slotId = slotResult.rows[0].id;
+      
+      // Check if entry already exists
+      const existingResult = await client.query(
+        "SELECT id FROM operation_hourly_entries WHERE operation_id = $1 AND slot_id = $2",
+        [operationId, slotId]
+      );
+      
+      // Save/update hourly entry
+      const hourlyQuery = existingResult.rows.length > 0 ? `
+        UPDATE operation_hourly_entries 
+        SET stitched_qty = $1, updated_at = NOW()
+        WHERE operation_id = $2 AND slot_id = $3
+        RETURNING id
+      ` : `
+        INSERT INTO operation_hourly_entries (
+          run_id,
+          operation_id,
+          slot_id,
+          stitched_qty,
+          created_at,
+          updated_at
+        )
+        VALUES ($4, $2, $3, $1, NOW(), NOW())
+        RETURNING id
+      `;
+      
+      const params = existingResult.rows.length > 0 
+        ? [parseFloat(stitchedQty) || 0, operationId, slotId]
+        : [parseFloat(stitchedQty) || 0, operationId, slotId, runId];
+      
+      await client.query(hourlyQuery, params);
+      
+      if (existingResult.rows.length > 0) {
+        updatedCount++;
+      } else {
+        savedCount++;
+      }
+    }
+
+    await client.query("COMMIT");
+    
+    console.log(`✅ Hourly data updated for run ${runId}: ${savedCount} new, ${updatedCount} updated`);
+    
+    res.json({ 
+      success: true, 
+      message: "Hourly data updated",
+      savedCount,
+      updatedCount
+    });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("❌ Error updating hourly data:", err.message);
+    res.status(500).json({ 
+      success: false, 
+      error: err.message 
+    });
+  } finally {
+    client.release();
+  }
+});
+
+// ✅ Add operation to existing run
+app.post("/api/add-operation/:runId", async (req, res) => {
+  const client = await pool.connect();
+  
+  try {
+    await client.query("BEGIN");
+    
+    const { runId } = req.params;
+    const { operatorNo, operatorName, operationName, t1, t2, t3, t4, t5, capacityPerHour } = req.body;
+    
+    if (!operatorNo || !operationName) {
+      return res.status(400).json({ 
+        success: false, 
+        error: "Missing operator number or operation name" 
+      });
+    }
+    
+    // Get or create operator
+    const operatorResult = await client.query(`
+      INSERT INTO run_operators (run_id, operator_no, operator_name, created_at)
+      VALUES ($1, $2, $3, NOW())
+      ON CONFLICT (run_id, operator_no) 
+      DO UPDATE SET operator_name = EXCLUDED.operator_name
+      RETURNING id
+    `, [runId, parseInt(operatorNo), operatorName || null]);
+    
+    const operatorId = operatorResult.rows[0].id;
+    
+    // Add operation
+    const operationResult = await client.query(`
+      INSERT INTO operator_operations (
+        run_id,
+        run_operator_id,
+        operation_name,
+        t1_sec,
+        t2_sec,
+        t3_sec,
+        t4_sec,
+        t5_sec,
+        capacity_per_hour,
+        created_at
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+      ON CONFLICT (run_operator_id, operation_name)
+      DO UPDATE SET 
+        t1_sec = EXCLUDED.t1_sec,
+        t2_sec = EXCLUDED.t2_sec,
+        t3_sec = EXCLUDED.t3_sec,
+        t4_sec = EXCLUDED.t4_sec,
+        t5_sec = EXCLUDED.t5_sec,
+        capacity_per_hour = EXCLUDED.capacity_per_hour
+      RETURNING id
+    `, [
+      runId,
+      operatorId,
+      operationName,
+      t1 ? parseFloat(t1) : null,
+      t2 ? parseFloat(t2) : null,
+      t3 ? parseFloat(t3) : null,
+      t4 ? parseFloat(t4) : null,
+      t5 ? parseFloat(t5) : null,
+      capacityPerHour || 0
+    ]);
+    
+    await client.query("COMMIT");
+    
+    res.json({ 
+      success: true, 
+      message: "Operation added successfully",
+      operationId: operationResult.rows[0].id
+    });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("❌ Error adding operation:", err.message);
+    res.status(500).json({ 
+      success: false, 
+      error: err.message 
+    });
+  } finally {
+    client.release();
+  }
+});
+
 testConnection();
 
 const PORT = process.env.PORT || 5000;
