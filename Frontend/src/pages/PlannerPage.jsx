@@ -1,8 +1,8 @@
-
 import { useMemo, useState } from "react";
 import HeaderForm from "../components/HeaderForm";
 import MetaSummary from "../components/MetaSummary";
 import OperationPlanner from "../components/OperationPlanner";
+import SavedRunsViewer from "../components/SavedRunsViewer"; // ✅ Import the new component
 import { calcTargetFromSAM } from "../utils/calc";
 import { buildShiftSlots } from "../utils/timeslots";
 import Navbar from "../components/Navbar";
@@ -20,6 +20,7 @@ const initialHeader = {
 export default function PlannerPage() {
   const [header, setHeader] = useState(initialHeader);
   const [currentRunId, setCurrentRunId] = useState(null); // ✅ Added: store current run ID
+  const [mode, setMode] = useState("planner"); // ✅ "planner" or "view"
 
   // ✅ Quick nav state
   const [activePanel, setActivePanel] = useState("inputs"); // inputs | summary | operations
@@ -91,92 +92,128 @@ export default function PlannerPage() {
             </div>
           </div>
 
-          {/* ✅ QUICK ACCESS BUTTONS */}
-          <div className="flex flex-wrap gap-2">
-            <QuickBtn active={activePanel === "inputs"} onClick={() => setActivePanel("inputs")}>
-              Line Inputs
-            </QuickBtn>
-            <QuickBtn active={activePanel === "summary"} onClick={() => setActivePanel("summary")}>
-              Meta Summary
-            </QuickBtn>
-            <QuickBtn active={activePanel === "operations"} onClick={() => setActivePanel("operations")}>
-              Operations
-            </QuickBtn>
+          {/* ✅ MODE TOGGLE BUTTONS */}
+          <div className="flex gap-3">
+            <button
+              onClick={() => setMode("planner")}
+              className={`rounded-xl px-4 py-2 text-sm font-medium border ${
+                mode === "planner" 
+                  ? "bg-gray-900 text-white border-gray-900" 
+                  : "bg-white text-gray-800 border-gray-200 hover:border-gray-300"
+              }`}
+            >
+              Create New
+            </button>
+            <button
+              onClick={() => setMode("view")}
+              className={`rounded-xl px-4 py-2 text-sm font-medium border ${
+                mode === "view" 
+                  ? "bg-gray-900 text-white border-gray-900" 
+                  : "bg-white text-gray-800 border-gray-200 hover:border-gray-300"
+              }`}
+            >
+              View Saved
+            </button>
           </div>
 
-          {/* ✅ OPERATOR NO FILTER BUTTONS */}
-          <div className="rounded-2xl border bg-white shadow-sm p-3">
-            <div className="text-xs font-medium text-gray-700 mb-2">
-              Quick Operator Filter (by No)
-            </div>
-
+          {/* ✅ QUICK ACCESS BUTTONS (only shown in planner mode) */}
+          {mode === "planner" && (
             <div className="flex flex-wrap gap-2">
-              <Pill
-                active={selectedOperatorNo === "ALL"}
-                onClick={() => setSelectedOperatorNo("ALL")}
-              >
-                All
-              </Pill>
+              <QuickBtn active={activePanel === "inputs"} onClick={() => setActivePanel("inputs")}>
+                Line Inputs
+              </QuickBtn>
+              <QuickBtn active={activePanel === "summary"} onClick={() => setActivePanel("summary")}>
+                Meta Summary
+              </QuickBtn>
+              <QuickBtn active={activePanel === "operations"} onClick={() => setActivePanel("operations")}>
+                Operations
+              </QuickBtn>
+            </div>
+          )}
 
-              {operatorButtons.length ? (
-                operatorButtons.map((no) => (
-                  <Pill
-                    key={no}
-                    active={selectedOperatorNo === no}
-                    onClick={() => setSelectedOperatorNo(no)}
-                    title={`Operator ${no}`}
-                  >
-                    Operator {no}
-                  </Pill>
-                ))
-              ) : (
-                <div className="text-xs text-gray-500">
-                  Add Operator No in Step 2 to enable quick filtering.
+          {/* ✅ OPERATOR NO FILTER BUTTONS (only shown in planner mode) */}
+          {mode === "planner" && (
+            <div className="rounded-2xl border bg-white shadow-sm p-3">
+              <div className="text-xs font-medium text-gray-700 mb-2">
+                Quick Operator Filter (by No)
+              </div>
+
+              <div className="flex flex-wrap gap-2">
+                <Pill
+                  active={selectedOperatorNo === "ALL"}
+                  onClick={() => setSelectedOperatorNo("ALL")}
+                >
+                  All
+                </Pill>
+
+                {operatorButtons.length ? (
+                  operatorButtons.map((no) => (
+                    <Pill
+                      key={no}
+                      active={selectedOperatorNo === no}
+                      onClick={() => setSelectedOperatorNo(no)}
+                      title={`Operator ${no}`}
+                    >
+                      Operator {no}
+                    </Pill>
+                  ))
+                ) : (
+                  <div className="text-xs text-gray-500">
+                    Add Operator No in Step 2 to enable quick filtering.
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* ✅ MAIN CONTENT AREA */}
+        {mode === "planner" ? (
+          // Existing planner content
+          <>
+            {activePanel === "inputs" && (
+              <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+                <div className="lg:col-span-2">
+                  {/* Pass onSaveSuccess callback to HeaderForm */}
+                  <HeaderForm 
+                    value={header} 
+                    onChange={setHeader}  
+                    slots={slots}
+                    onSaveSuccess={handleSaveSuccess}
+                  />
                 </div>
-              )}
+                <div className="lg:col-span-1">
+                  <MetaSummary header={header} target={target} slots={slots} />
+                </div>
+              </div>
+            )}
+
+            {activePanel === "summary" && (
+              <div className="grid grid-cols-1">
+                <MetaSummary header={header} target={target} slots={slots} />
+              </div>
+            )}
+
+            {activePanel === "operations" && (
+              <div className="mt-2">
+                <OperationPlanner
+                  target={target}
+                  slots={slots}
+                  selectedOperatorNo={selectedOperatorNo} // ✅ filter by operator no
+                  onOperatorNosChange={setOperatorNos}   // ✅ collect operator nos for buttons
+                  currentRunId={currentRunId}            // ✅ pass current run ID for saving
+                />
+              </div>
+            )}
+
+            <div className="mt-10 text-xs text-gray-500">
+              Notes: Target uses SAM (minutes/piece) and the selected efficiency. 
+              Capacity/hour uses 3600 / average(t1..t5).
             </div>
-          </div>
-        </div>
-
-        {/* ✅ PANEL DISPLAY */}
-        {activePanel === "inputs" && (
-          <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-            <div className="lg:col-span-2">
-              {/* Pass onSaveSuccess callback to HeaderForm */}
-              <HeaderForm 
-                value={header} 
-                onChange={setHeader}  
-                slots={slots}
-                onSaveSuccess={handleSaveSuccess}
-              />
-            </div>
-            <div className="lg:col-span-1">
-              <MetaSummary header={header} target={target} slots={slots} />
-            </div>
-          </div>
+          </>
+        ) : (
+          <SavedRunsViewer onBack={() => setMode("planner")} />
         )}
-
-        {activePanel === "summary" && (
-          <div className="grid grid-cols-1">
-            <MetaSummary header={header} target={target} slots={slots} />
-          </div>
-        )}
-
-        {activePanel === "operations" && (
-          <div className="mt-2">
-            <OperationPlanner
-              target={target}
-              slots={slots}
-              selectedOperatorNo={selectedOperatorNo} // ✅ filter by operator no
-              onOperatorNosChange={setOperatorNos}   // ✅ collect operator nos for buttons
-              currentRunId={currentRunId}            // ✅ pass current run ID for saving
-            />
-          </div>
-        )}
-
-        <div className="mt-10 text-xs text-gray-500">
-          Notes: Target uses SAM (minutes/piece) and the selected efficiency. Capacity/hour uses 3600 / average(t1..t5).
-        </div>
       </div>
     </div>
   );

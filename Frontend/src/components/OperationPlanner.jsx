@@ -1,11 +1,11 @@
 
 import { useEffect, useMemo, useState } from "react";
-import { safeNum, calcCapacityPerHourFromTimes } from "../utils/calc";
+import { safeNum, calcCapacityPerHourFromTimes, calcCapacityPerHourForMultipleOperations } from "../utils/calc";
 import HourlyGrid from "./HourlyGrid";
 
 function makeId() {
   return (
-    globalThis.crypto?.randomUUID?.() ??
+    globalThis.crypto?.randomUUID?.() ||
     `row_${Date.now()}_${Math.random().toString(16).slice(2)}`
   );
 }
@@ -86,14 +86,37 @@ export default function OperationPlanner({
   const hasReady = safeNum(target) > 0 && (slots?.length || 0) > 0;
 
   const computedRows = useMemo(() => {
+    // Group rows by operator to check for multiple operations
+    const rowsByOperator = {};
+    
+    rows.forEach((row) => {
+      const operatorNo = normalizeNo(row.operatorNo);
+      if (!operatorNo) return;
+      
+      if (!rowsByOperator[operatorNo]) {
+        rowsByOperator[operatorNo] = [];
+      }
+      rowsByOperator[operatorNo].push(row);
+    });
+    
     return rows.map((row) => {
-      const capPerOperator = calcCapacityPerHourFromTimes(
-        row.t1,
-        row.t2,
-        row.t3,
-        row.t4,
-        row.t5
-      );
+      const operatorNo = normalizeNo(row.operatorNo);
+      let capPerOperator = 0;
+      
+      if (operatorNo && rowsByOperator[operatorNo]) {
+        // Calculate capacity for this operator (handles both single and multiple operations)
+        capPerOperator = calcCapacityPerHourForMultipleOperations(rowsByOperator[operatorNo]);
+      } else {
+        // Unassigned operator - use single operation calculation
+        capPerOperator = calcCapacityPerHourFromTimes(
+          row.t1,
+          row.t2,
+          row.t3,
+          row.t4,
+          row.t5
+        );
+      }
+      
       return { ...row, capPerOperator };
     });
   }, [rows]);
@@ -257,66 +280,65 @@ export default function OperationPlanner({
   };
 
   // ✅ SAVE HOURLY STITCHED DATA (Separate function)
- // ✅ SAVE HOURLY STITCHED DATA (Separate function) - FIXED
-const handleSaveHourlyData = async () => {
-  if (!currentRunId) {
-    setSaveHourlyMessage("❌ Please save operations first");
-    return;
-  }
-
-  setSavingHourly(true);
-  setSaveHourlyMessage("");
-
-  try {
-    // Prepare hourly data for all operations
-    const hourlyPayloads = [];
-    
-    computedRows.forEach(row => {
-      if (row.stitched && row.operatorNo && row.operation) {
-        // Find the slot labels from slots array
-        (slots || []).forEach((slot, index) => {
-          const stitchedQty = row.stitched[slot.id];
-          if (stitchedQty !== "" && stitchedQty !== null && stitchedQty !== undefined) {
-            hourlyPayloads.push({
-              runId: currentRunId,
-              operatorNo: row.operatorNo,
-              operationName: row.operation,
-              slotLabel: slot.label,  // Use slot.label not slot.id
-              stitchedQty: parseFloat(stitchedQty) || 0
-            });
-          }
-        });
-      }
-    });
-
-    if (hourlyPayloads.length === 0) {
-      setSaveHourlyMessage("⚠️ No hourly data to save");
-      setSavingHourly(false);
+  const handleSaveHourlyData = async () => {
+    if (!currentRunId) {
+      setSaveHourlyMessage("❌ Please save operations first");
       return;
     }
 
-    console.log(`📤 Saving ${hourlyPayloads.length} hourly entries...`);
-    
-    // Save all hourly entries
-    const response = await fetch("http://localhost:5000/api/save-hourly-data", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ entries: hourlyPayloads })
-    });
+    setSavingHourly(true);
+    setSaveHourlyMessage("");
 
-    const data = await response.json();
+    try {
+      // Prepare hourly data for all operations
+      const hourlyPayloads = [];
+      
+      computedRows.forEach(row => {
+        if (row.stitched && row.operatorNo && row.operation) {
+          // Find the slot labels from slots array
+          (slots || []).forEach((slot, index) => {
+            const stitchedQty = row.stitched[slot.id];
+            if (stitchedQty !== "" && stitchedQty !== null && stitchedQty !== undefined) {
+              hourlyPayloads.push({
+                runId: currentRunId,
+                operatorNo: row.operatorNo,
+                operationName: row.operation,
+                slotLabel: slot.label,  // Use slot.label not slot.id
+                stitchedQty: parseFloat(stitchedQty) || 0
+              });
+            }
+          });
+        }
+      });
 
-    if (data.success) {
-      setSaveHourlyMessage(`✅ Saved ${data.savedCount} hourly entries${data.skippedCount ? ` (${data.skippedCount} skipped)` : ''}`);
-    } else {
-      setSaveHourlyMessage(`❌ Error: ${data.error}`);
+      if (hourlyPayloads.length === 0) {
+        setSaveHourlyMessage("⚠️ No hourly data to save");
+        setSavingHourly(false);
+        return;
+      }
+
+      console.log(`📤 Saving ${hourlyPayloads.length} hourly entries...`);
+      
+      // Save all hourly entries
+      const response = await fetch("http://localhost:5000/api/save-hourly-data", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ entries: hourlyPayloads })
+      });
+
+      const data = await response.json();
+
+      if (data.success) {
+        setSaveHourlyMessage(`✅ Saved ${data.savedCount} hourly entries${data.skippedCount ? ` (${data.skippedCount} skipped)` : ''}`);
+      } else {
+        setSaveHourlyMessage(`❌ Error: ${data.error}`);
+      }
+    } catch (err) {
+      setSaveHourlyMessage(`❌ Failed to save hourly data: ${err.message}`);
+    } finally {
+      setSavingHourly(false);
     }
-  } catch (err) {
-    setSaveHourlyMessage(`❌ Failed to save hourly data: ${err.message}`);
-  } finally {
-    setSavingHourly(false);
-  }
-};
+  };
 
   return (
     <div className="rounded-2xl border bg-white shadow-sm">
