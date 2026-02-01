@@ -5,6 +5,8 @@ import { BrowserRouter as Router, Routes, Route } from "react-router-dom";
 import PlannerPage from "./pages/PlannerPage";
 import LoginPage from "./components/LoginPage";
 import LineInfo from "./pages/LineInfo";
+import AdminDashboard from "./pages/AdminDashboard";
+import LineLeaderPage from "./pages/LineLeaderPage";
 
 
 
@@ -15,6 +17,8 @@ export default function App() {
         <Route path="/planner" element={<PlannerPage />} /> {/* changed from /home */}
         <Route path="/line_info" element={<LineInfo />} />
         <Route path="/" element={<LoginPage />} />
+        <Route path="/admin" element={<AdminDashboard />} />
+        <Route path="/lineleader" element={<LineLeaderPage />} />
       </Routes>
     </Router>
   );
