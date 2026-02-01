@@ -1,8 +1,8 @@
-
 require("dotenv").config();
 const express = require("express");
 const { Pool } = require("pg");
 const cors = require("cors");
+const bcrypt = require("bcrypt"); // ADD THIS LINE
 
 const app = express();
 app.use(cors());
@@ -23,6 +23,24 @@ const pool = new Pool({
 const createAllTables = async () => {
   try {
     console.log("🔄 Creating/verifying database tables...");
+
+    // 0. Create users table (add this at the beginning)
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS users(
+        id BIGSERIAL PRIMARY KEY,
+        username VARCHAR(50) UNIQUE NOT NULL,
+        password_hash VARCHAR(255) NOT NULL,
+        role VARCHAR(20) NOT NULL DEFAULT 'line_leader',
+        line_number INT NULL,
+        full_name VARCHAR(100) NULL,
+        is_active BOOLEAN NOT NULL DEFAULT TRUE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        CONSTRAINT chk_role CHECK (role IN ('engineer', 'line_leader', 'supervisor')),
+        CONSTRAINT chk_line_number CHECK (line_number IS NULL OR (line_number >= 1 AND line_number <= 26))
+      );
+    `);
+    console.log("✅ users table ready");
     
     // 1. Create line_runs table
     await pool.query(`
@@ -128,7 +146,9 @@ const createAllTables = async () => {
     `);
     console.log("✅ slot_targets table ready");
 
-    // Create indexes
+    // Create indexes - FIXED: Removed idx_line_runs_created_by since created_by column doesn't exist
+    await pool.query("CREATE INDEX IF NOT EXISTS idx_users_username ON users(username) WHERE is_active = TRUE;");
+    await pool.query("CREATE INDEX IF NOT EXISTS idx_users_role ON users(role, line_number);");
     await pool.query("CREATE INDEX IF NOT EXISTS idx_line_runs_line_date ON line_runs (line_no, run_date);");
     await pool.query("CREATE INDEX IF NOT EXISTS idx_shift_slots_run ON shift_slots(run_id);");
     await pool.query("CREATE INDEX IF NOT EXISTS idx_run_operators_run ON run_operators(run_id);");
@@ -139,10 +159,227 @@ const createAllTables = async () => {
     await pool.query("CREATE INDEX IF NOT EXISTS idx_hourly_entries_slot ON operation_hourly_entries(slot_id);");
     
     console.log("✅ All tables and indexes created successfully");
+    
+    // Create default users if they don't exist
+    await createDefaultUsers();
   } catch (err) {
     console.error("❌ Error creating tables:", err.message);
   }
 };
+
+// Function to create default users
+const createDefaultUsers = async () => {
+  try {
+    console.log("🔄 Creating default users...");
+    
+    const defaultUsers = [
+      {
+        username: 'engineer',
+        password: 'engineer',
+        role: 'engineer',
+        full_name: 'System Engineer'
+      }
+    ];
+    
+    // Add line leaders 1-26
+    for (let i = 1; i <= 26; i++) {
+      defaultUsers.push({
+        username: `line${i}`,
+        password: `line${i}`,
+        role: 'line_leader',
+        line_number: i,
+        full_name: `Line ${i} Leader`
+      });
+    }
+    
+    // Add a supervisor
+    defaultUsers.push({
+      username: 'supervisor',
+      password: 'supervisor123',
+      role: 'supervisor',
+      full_name: 'Production Supervisor'
+    });
+    
+    let createdCount = 0;
+    let updatedCount = 0;
+    
+    for (const user of defaultUsers) {
+      // Check if user exists
+      const existingUser = await pool.query(
+        'SELECT id FROM users WHERE username = $1',
+        [user.username]
+      );
+      
+      if (existingUser.rows.length === 0) {
+        // Hash password
+        const saltRounds = 10;
+        const passwordHash = await bcrypt.hash(user.password, saltRounds);
+        
+        // Insert new user
+        await pool.query(`
+          INSERT INTO users (username, password_hash, role, line_number, full_name, is_active)
+          VALUES ($1, $2, $3, $4, $5, $6)
+        `, [
+          user.username,
+          passwordHash,
+          user.role,
+          user.line_number || null,
+          user.full_name || user.username,
+          true
+        ]);
+        createdCount++;
+        console.log(`✅ Created user: ${user.username} (${user.role})`);
+      } else {
+        // Update existing user's password if needed
+        const saltRounds = 10;
+        const passwordHash = await bcrypt.hash(user.password, saltRounds);
+        
+        await pool.query(`
+          UPDATE users 
+          SET password_hash = $1, updated_at = NOW()
+          WHERE username = $2
+        `, [passwordHash, user.username]);
+        updatedCount++;
+        console.log(`✅ Updated user: ${user.username}`);
+      }
+    }
+    
+    console.log(`✅ Users ready: ${createdCount} created, ${updatedCount} updated`);
+    
+  } catch (err) {
+    console.error("❌ Error creating default users:", err.message);
+  }
+};
+
+// ✅ Login endpoint
+app.post("/api/login", async (req, res) => {
+  try {
+    const { username, password } = req.body;
+    
+    if (!username || !password) {
+      return res.status(400).json({
+        success: false,
+        error: "Username and password are required"
+      });
+    }
+    
+    // Find user
+    const userResult = await pool.query(`
+      SELECT id, username, password_hash, role, line_number, full_name, is_active
+      FROM users 
+      WHERE username = $1 AND is_active = TRUE
+    `, [username]);
+    
+    if (userResult.rows.length === 0) {
+      return res.status(401).json({
+        success: false,
+        error: "Invalid username or password"
+      });
+    }
+    
+    const user = userResult.rows[0];
+    
+    // Verify password
+    const isValidPassword = await bcrypt.compare(password, user.password_hash);
+    
+    if (!isValidPassword) {
+      return res.status(401).json({
+        success: false,
+        error: "Invalid username or password"
+      });
+    }
+    
+    // Remove password hash from response
+    delete user.password_hash;
+    
+    // Generate a simple token (in production, use JWT)
+    const token = Buffer.from(`${user.id}:${Date.now()}`).toString('base64');
+    
+    res.json({
+      success: true,
+      message: "Login successful",
+      user: user,
+      token: token
+    });
+    
+  } catch (err) {
+    console.error("❌ Login error:", err.message);
+    res.status(500).json({
+      success: false,
+      error: "Internal server error"
+    });
+  }
+});
+
+// ✅ Middleware to verify authentication
+const authenticateToken = async (req, res, next) => {
+  try {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1]; // Bearer TOKEN
+    
+    if (!token) {
+      return res.status(401).json({
+        success: false,
+        error: "Authentication required"
+      });
+    }
+    
+    // Simple token validation (in production, use proper JWT validation)
+    const decoded = Buffer.from(token, 'base64').toString('ascii');
+    const [userId, timestamp] = decoded.split(':');
+    
+    // Check if token is not too old (24 hours)
+    const tokenAge = Date.now() - parseInt(timestamp);
+    const MAX_TOKEN_AGE = 24 * 60 * 60 * 1000; // 24 hours
+    
+    if (tokenAge > MAX_TOKEN_AGE) {
+      return res.status(401).json({
+        success: false,
+        error: "Session expired"
+      });
+    }
+    
+    // Verify user exists and is active
+    const userResult = await pool.query(`
+      SELECT id, username, role, line_number, full_name
+      FROM users 
+      WHERE id = $1 AND is_active = TRUE
+    `, [parseInt(userId)]);
+    
+    if (userResult.rows.length === 0) {
+      return res.status(401).json({
+        success: false,
+        error: "User not found or inactive"
+      });
+    }
+    
+    req.user = userResult.rows[0];
+    next();
+  } catch (err) {
+    console.error("❌ Authentication error:", err.message);
+    res.status(401).json({
+      success: false,
+      error: "Invalid authentication token"
+    });
+  }
+};
+
+// ✅ Get current user info
+app.get("/api/me", authenticateToken, async (req, res) => {
+  res.json({
+    success: true,
+    user: req.user
+  });
+});
+
+// ✅ Logout endpoint
+app.post("/api/logout", (req, res) => {
+  // Since we're using simple tokens, just acknowledge the logout
+  res.json({
+    success: true,
+    message: "Logged out successfully"
+  });
+});
 
 async function testConnection() {
   try {
@@ -449,6 +686,256 @@ app.post("/api/save-operations", async (req, res) => {
   }
 });
 
+// ✅ User management endpoints (for engineers/supervisors only)
+const requireEngineerOrSupervisor = (req, res, next) => {
+  if (req.user.role !== 'engineer' && req.user.role !== 'supervisor') {
+    return res.status(403).json({
+      success: false,
+      error: "Access denied. Engineer or supervisor role required."
+    });
+  }
+  next();
+};
+
+// Get all users
+app.get("/api/users", authenticateToken, requireEngineerOrSupervisor, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT id, username, role, line_number, full_name, is_active, created_at, updated_at
+      FROM users
+      ORDER BY 
+        CASE role 
+          WHEN 'engineer' THEN 1
+          WHEN 'supervisor' THEN 2
+          WHEN 'line_leader' THEN 3
+          ELSE 4
+        END,
+        line_number NULLS FIRST,
+        username
+    `);
+    
+    res.json({
+      success: true,
+      users: result.rows
+    });
+  } catch (err) {
+    console.error("❌ Error fetching users:", err.message);
+    res.status(500).json({
+      success: false,
+      error: err.message
+    });
+  }
+});
+
+//create new users
+app.post("/api/users", authenticateToken, requireEngineerOrSupervisor, async (req, res) => {
+  try {
+    const { username, password, role, line_number, full_name } = req.body;
+    
+    if (!username || !password || !role) {
+      return res.status(400).json({
+        success: false,
+        error: "Username, password, and role are required"
+      });
+    }
+    
+    // Validate role
+    const validRoles = ['engineer', 'line_leader', 'supervisor'];
+    if (!validRoles.includes(role)) {
+      return res.status(400).json({
+        success: false,
+        error: "Invalid role. Must be 'engineer', 'line_leader', or 'supervisor'"
+      });
+    }
+    
+    // Validate line_number for line leaders
+    if (role === 'line_leader') {
+      if (!line_number || line_number < 1 || line_number > 26) {
+        return res.status(400).json({
+          success: false,
+          error: "Line leaders must have a line number between 1 and 26"
+        });
+      }
+      
+      // Check if line number is already assigned
+      const existingLineUser = await pool.query(`
+        SELECT username FROM users 
+        WHERE role = 'line_leader' AND line_number = $1 AND is_active = TRUE
+      `, [line_number]);
+      
+      if (existingLineUser.rows.length > 0) {
+        return res.status(400).json({
+          success: false,
+          error: `Line ${line_number} is already assigned to user: ${existingLineUser.rows[0].username}`
+        });
+      }
+    }
+    
+    // Hash password
+    const saltRounds = 10;
+    const passwordHash = await bcrypt.hash(password, saltRounds);
+    
+    const result = await pool.query(`
+      INSERT INTO users (username, password_hash, role, line_number, full_name, is_active)
+      VALUES ($1, $2, $3, $4, $5, $6)
+      RETURNING id, username, role, line_number, full_name, is_active, created_at
+    `, [
+      username,
+      passwordHash,
+      role,
+      line_number || null,
+      full_name || username,
+      true
+    ]);
+    
+    res.json({
+      success: true,
+      message: "User created successfully",
+      user: result.rows[0]
+    });
+    
+  } catch (err) {
+    console.error("❌ Error creating user:", err.message);
+    
+    if (err.code === '23505') { // Unique violation
+      res.status(400).json({
+        success: false,
+        error: "Username already exists"
+      });
+    } else {
+      res.status(500).json({
+        success: false,
+        error: err.message
+      });
+    }
+  }
+});
+
+// Update user
+app.put("/api/users/:id", authenticateToken, requireEngineerOrSupervisor, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { username, password, role, line_number, full_name, is_active } = req.body;
+    
+    // Build update query dynamically
+    const updates = [];
+    const values = [];
+    let valueIndex = 1;
+    
+    if (username !== undefined) {
+      updates.push(`username = $${valueIndex++}`);
+      values.push(username);
+    }
+    
+    if (password !== undefined) {
+      const saltRounds = 10;
+      const passwordHash = await bcrypt.hash(password, saltRounds);
+      updates.push(`password_hash = $${valueIndex++}`);
+      values.push(passwordHash);
+    }
+    
+    if (role !== undefined) {
+      updates.push(`role = $${valueIndex++}`);
+      values.push(role);
+    }
+    
+    if (line_number !== undefined) {
+      updates.push(`line_number = $${valueIndex++}`);
+      values.push(line_number);
+    }
+    
+    if (full_name !== undefined) {
+      updates.push(`full_name = $${valueIndex++}`);
+      values.push(full_name);
+    }
+    
+    if (is_active !== undefined) {
+      updates.push(`is_active = $${valueIndex++}`);
+      values.push(is_active);
+    }
+    
+    updates.push(`updated_at = NOW()`);
+    
+    if (updates.length === 1) { // Only updated_at was added
+      return res.status(400).json({
+        success: false,
+        error: "No fields to update"
+      });
+    }
+    
+    values.push(id);
+    
+    const query = `
+      UPDATE users 
+      SET ${updates.join(', ')}
+      WHERE id = $${valueIndex}
+      RETURNING id, username, role, line_number, full_name, is_active, created_at, updated_at
+    `;
+    
+    const result = await pool.query(query, values);
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: "User not found"
+      });
+    }
+    
+    res.json({
+      success: true,
+      message: "User updated successfully",
+      user: result.rows[0]
+    });
+    
+  } catch (err) {
+    console.error("❌ Error updating user:", err.message);
+    res.status(500).json({
+      success: false,
+      error: err.message
+    });
+  }
+});
+
+// Delete user (soft delete)
+app.delete("/api/users/:id", authenticateToken, requireEngineerOrSupervisor, async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    // Prevent deleting yourself
+    if (parseInt(id) === req.user.id) {
+      return res.status(400).json({
+        success: false,
+        error: "Cannot delete your own account"
+      });
+    }
+    
+    const result = await pool.query(`
+      UPDATE users 
+      SET is_active = FALSE, updated_at = NOW()
+      WHERE id = $1 AND is_active = TRUE
+      RETURNING id, username
+    `, [id]);
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: "User not found or already inactive"
+      });
+    }
+    
+    res.json({
+      success: true,
+      message: "User deactivated successfully"
+    });
+    
+  } catch (err) {
+    console.error("❌ Error deleting user:", err.message);
+    res.status(500).json({
+      success: false,
+      error: err.message
+    });
+  }
+});
 // ✅ Save hourly stitched data separately - FIXED VERSION
 app.post("/api/save-hourly-data", async (req, res) => {
   const client = await pool.connect();
@@ -806,6 +1293,52 @@ app.get("/api/line-runs/:lineNo", async (req, res) => {
     });
   }
 });
+
+app.get("/api/lineleader/latest-run", async (req, res) => {
+  try {
+    const line = String(req.query.line || "").trim(); // ✅ keep as TEXT
+    if (!line) return res.json({ success: false, error: "line is required" });
+
+    // ✅ latest run for that line (line_no is TEXT)
+    const runQ = await pool.query(
+      `
+      SELECT *
+      FROM line_runs
+      WHERE line_no = $1
+      ORDER BY created_at DESC
+      LIMIT 1
+      `,
+      [line]
+    );
+
+    if (runQ.rowCount === 0) {
+      return res.json({ success: false, error: `No runs found for line ${line}` });
+    }
+
+    const run = runQ.rows[0];
+
+    // ✅ slots for that run (table is shift_slots, order column is slot_order)
+    const slotsQ = await pool.query(
+      `
+      SELECT *
+      FROM shift_slots
+      WHERE run_id = $1
+      ORDER BY slot_order ASC
+      `,
+      [run.id]
+    );
+
+    return res.json({
+      success: true,
+      run,
+      slots: slotsQ.rows,
+    });
+  } catch (e) {
+    console.error("❌ /api/lineleader/latest-run error:", e);
+    return res.status(500).json({ success: false, error: e.message });
+  }
+});
+
 
 // ✅ Get complete run data for editing
 app.get("/api/run/:runId", async (req, res) => {
