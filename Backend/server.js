@@ -131,6 +131,26 @@ const createAllTables = async () => {
     `);
     console.log("✅ operation_hourly_entries table ready");
 
+    // 5.5 Create operation_sewed_entries table (Line Leader actuals)
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS operation_sewed_entries(
+    id BIGSERIAL PRIMARY KEY,
+    run_id BIGINT NOT NULL REFERENCES line_runs(id) ON DELETE CASCADE,
+    operation_id BIGINT NOT NULL REFERENCES operator_operations(id) ON DELETE CASCADE,
+    slot_id BIGINT NOT NULL REFERENCES shift_slots(id) ON DELETE CASCADE,
+
+    sewed_qty NUMERIC(12,2) NOT NULL DEFAULT 0,
+
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    UNIQUE (operation_id, slot_id),
+    CONSTRAINT chk_sewed_qty_nonnegative CHECK (sewed_qty >= 0)
+  );
+`);
+console.log("✅ operation_sewed_entries table ready");
+
+
     // 6. Create slot_targets table
     await pool.query(`
       CREATE TABLE IF NOT EXISTS slot_targets(
@@ -147,6 +167,8 @@ const createAllTables = async () => {
     console.log("✅ slot_targets table ready");
 
     // Create indexes - FIXED: Removed idx_line_runs_created_by since created_by column doesn't exist
+   await pool.query("CREATE INDEX IF NOT EXISTS idx_sewed_run ON operation_sewed_entries(run_id);");
+   await pool.query("CREATE INDEX IF NOT EXISTS idx_sewed_slot ON operation_sewed_entries(slot_id);");
     await pool.query("CREATE INDEX IF NOT EXISTS idx_users_username ON users(username) WHERE is_active = TRUE;");
     await pool.query("CREATE INDEX IF NOT EXISTS idx_users_role ON users(role, line_number);");
     await pool.query("CREATE INDEX IF NOT EXISTS idx_line_runs_line_date ON line_runs (line_no, run_date);");
@@ -1079,45 +1101,118 @@ app.post("/api/save-hourly-data", async (req, res) => {
   }
 });
 
+app.post("/api/lineleader/update-sewed/:runId", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    const { runId } = req.params;
+    const { entries } = req.body;
+
+    if (!entries || !Array.isArray(entries)) {
+      return res.status(400).json({
+        success: false,
+        error: "Missing entries array"
+      });
+    }
+
+    let updatedCount = 0;
+
+    for (const entry of entries) {
+      const { operatorNo, operationName, slotLabel, sewedQty } = entry;
+
+      if (!operatorNo || !operationName || !slotLabel) continue;
+
+      // 1) find operation id
+      const opResult = await client.query(
+        `
+        SELECT o.id as op_id
+        FROM operator_operations o
+        JOIN run_operators ro ON o.run_operator_id = ro.id
+        WHERE o.run_id = $1
+          AND ro.operator_no = $2
+          AND o.operation_name = $3
+        LIMIT 1
+        `,
+        [runId, parseInt(operatorNo), operationName]
+      );
+
+      if (opResult.rows.length === 0) continue;
+      const operationId = opResult.rows[0].op_id;
+
+      // 2) find slot id
+      const slotResult = await client.query(
+        `SELECT id FROM shift_slots WHERE run_id = $1 AND slot_label = $2 LIMIT 1`,
+        [runId, slotLabel]
+      );
+
+      if (slotResult.rows.length === 0) continue;
+      const slotId = slotResult.rows[0].id;
+
+      // 3) upsert into operation_sewed_entries
+      await client.query(
+        `
+        INSERT INTO operation_sewed_entries (run_id, operation_id, slot_id, sewed_qty, created_at, updated_at)
+        VALUES ($1, $2, $3, $4, now(), now())
+        ON CONFLICT (operation_id, slot_id)
+        DO UPDATE SET sewed_qty = EXCLUDED.sewed_qty, updated_at = now()
+        `,
+        [runId, operationId, slotId, Number(sewedQty || 0)]
+      );
+
+      updatedCount++;
+    }
+
+    await client.query("COMMIT");
+    return res.json({ success: true, updatedCount });
+  } catch (e) {
+    await client.query("ROLLBACK");
+    console.error("❌ update-sewed error:", e);
+    return res.status(500).json({ success: false, error: e.message });
+  } finally {
+    client.release();
+  }
+});
+
 // ✅ Get saved data for a run
 app.get("/api/get-run-data/:runId", async (req, res) => {
   try {
     const { runId } = req.params;
-    
-    // Get line run data
+
+    // 1) Get line run data
     const runResult = await pool.query(
       "SELECT * FROM line_runs WHERE id = $1",
       [runId]
     );
-    
+
     if (runResult.rows.length === 0) {
-      return res.status(404).json({ 
-        success: false, 
-        error: "Run not found" 
+      return res.status(404).json({
+        success: false,
+        error: "Run not found"
       });
     }
-    
+
     const runData = runResult.rows[0];
-    
-    // Get shift slots
+
+    // 2) Get shift slots
     const slotsResult = await pool.query(
-      `SELECT id, slot_order, slot_label, slot_start, slot_end, planned_hours 
-       FROM shift_slots 
-       WHERE run_id = $1 
+      `SELECT id, slot_order, slot_label, slot_start, slot_end, planned_hours
+       FROM shift_slots
+       WHERE run_id = $1
        ORDER BY slot_order`,
       [runId]
     );
-    
-    // Get operators
+
+    // 3) Get operators
     const operatorsResult = await pool.query(
-      `SELECT id, operator_no, operator_name 
-       FROM run_operators 
-       WHERE run_id = $1 
+      `SELECT id, operator_no, operator_name
+       FROM run_operators
+       WHERE run_id = $1
        ORDER BY operator_no`,
       [runId]
     );
-    
-    // Get slot targets
+
+    // 4) Get slot targets
     const slotTargetsResult = await pool.query(
       `SELECT s.slot_label, t.slot_target, t.cumulative_target
        FROM slot_targets t
@@ -1126,36 +1221,53 @@ app.get("/api/get-run-data/:runId", async (req, res) => {
        ORDER BY s.slot_order`,
       [runId]
     );
-    
-    // Get operations with their hourly data
+
+    // 5) Get operations with stitched_data + sewed_data
     const operationsData = [];
-    
+
     for (const operator of operatorsResult.rows) {
       const operationsResult = await pool.query(
-        `SELECT o.*, 
-                json_agg(
-                  json_build_object(
-                    'slot_label', s.slot_label,
-                    'stitched_qty', h.stitched_qty
-                  ) ORDER BY ss.slot_order
-                ) FILTER (WHERE h.stitched_qty IS NOT NULL) as hourly_data
+        `SELECT 
+          o.id,
+          o.operation_name,
+          o.t1_sec,
+          o.t2_sec,
+          o.t3_sec,
+          o.t4_sec,
+          o.t5_sec,
+          o.capacity_per_hour,
+
+          json_object_agg(
+            COALESCE(s.slot_label, ''),
+            COALESCE(h.stitched_qty, 0)
+          ) FILTER (WHERE s.slot_label IS NOT NULL) as stitched_data,
+
+          json_object_agg(
+            COALESCE(s2.slot_label, ''),
+            COALESCE(se.sewed_qty, 0)
+          ) FILTER (WHERE s2.slot_label IS NOT NULL) as sewed_data
+
          FROM operator_operations o
+
          LEFT JOIN operation_hourly_entries h ON o.id = h.operation_id
          LEFT JOIN shift_slots s ON h.slot_id = s.id
-         LEFT JOIN shift_slots ss ON s.id = ss.id
+
+         LEFT JOIN operation_sewed_entries se ON o.id = se.operation_id
+         LEFT JOIN shift_slots s2 ON se.slot_id = s2.id
+
          WHERE o.run_operator_id = $1 AND o.run_id = $2
          GROUP BY o.id
-         ORDER BY o.created_at`,
+         ORDER BY o.id`,
         [operator.id, runId]
       );
-      
+
       operationsData.push({
         operator,
         operations: operationsResult.rows
       });
     }
-    
-    res.json({
+
+    return res.json({
       success: true,
       run: runData,
       slots: slotsResult.rows,
@@ -1163,15 +1275,16 @@ app.get("/api/get-run-data/:runId", async (req, res) => {
       operations: operationsData,
       slotTargets: slotTargetsResult.rows
     });
-    
+
   } catch (err) {
     console.error("❌ Error fetching run data:", err.message);
-    res.status(500).json({ 
-      success: false, 
-      error: err.message 
+    return res.status(500).json({
+      success: false,
+      error: err.message
     });
   }
 });
+
 
 // Health check
 app.get("/api/health", async (req, res) => {
