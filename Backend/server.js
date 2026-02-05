@@ -165,6 +165,8 @@ console.log("✅ operation_sewed_entries table ready");
       );
     `);
     console.log("✅ slot_targets table ready");
+//production_alerts table
+
 
     // Create indexes - FIXED: Removed idx_line_runs_created_by since created_by column doesn't exist
    await pool.query("CREATE INDEX IF NOT EXISTS idx_sewed_run ON operation_sewed_entries(run_id);");
@@ -1752,6 +1754,8 @@ app.post("/api/add-operation/:runId", async (req, res) => {
     client.release();
   }
 });
+
+
 
 testConnection();
 
